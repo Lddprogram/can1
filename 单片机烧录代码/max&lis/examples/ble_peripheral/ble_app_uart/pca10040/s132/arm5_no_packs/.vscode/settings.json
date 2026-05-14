@@ -1,0 +1,9 @@
+{
+    "files.associations": {
+        "mylog.h": "c",
+        "driver_mpu6050_interface.h": "c",
+        "mpu6050_port.h": "c",
+        "nrf_drv_gpiote.h": "c",
+        "mpu6050.h": "c"
+    }
+}
