@@ -2,6 +2,7 @@
 .\_build\mpu6050.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdbool.h
 .\_build\mpu6050.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
 .\_build\mpu6050.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
+.\_build\mpu6050.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
 .\_build\mpu6050.o: ..\..\..\..\..\..\integration\nrfx\legacy\nrf_drv_twi.h
 .\_build\mpu6050.o: ..\..\..\..\..\..\modules\nrfx\nrfx.h
 .\_build\mpu6050.o: ..\..\..\..\..\..\integration\nrfx\nrfx_config.h
@@ -38,7 +39,6 @@
 .\_build\mpu6050.o: ..\..\..\..\..\..\components\softdevice\s132\headers\nrf_error_soc.h
 .\_build\mpu6050.o: ..\..\..\..\..\..\components\softdevice\s132\headers\nrf_nvic.h
 .\_build\mpu6050.o: ..\..\..\..\..\..\components\libraries\util\app_error.h
-.\_build\mpu6050.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
 .\_build\mpu6050.o: ..\..\..\..\..\..\components\libraries\util\sdk_errors.h
 .\_build\mpu6050.o: ..\..\..\..\..\..\components\libraries\util\app_error_weak.h
 .\_build\mpu6050.o: ..\..\..\..\..\..\modules\nrfx\soc/nrfx_coredep.h

@@ -100,6 +100,18 @@ bool mpu6050_register_read(uint8_t register_address, uint8_t *destination, uint8
 bool mpu6050_verify_product_id(void);
 
 
+typedef void (*mpu_mouse_transport_cb_t)(int8_t dx, int8_t dy);
+void mpu6050_set_mouse_transport(mpu_mouse_transport_cb_t cb);
+typedef enum
+{
+    MPU_MOUSE_PROFILE_STABLE = 0,
+    MPU_MOUSE_PROFILE_BALANCED,
+    MPU_MOUSE_PROFILE_FAST
+} mpu_mouse_profile_t;
+
+void mpu6050_set_mouse_profile(mpu_mouse_profile_t profile);
+void MPU6050_mouse_report_send(void);
+
 bool MPU6050_ReadGyro(int16_t *pGYRO_X , int16_t *pGYRO_Y , int16_t *pGYRO_Z );
 bool MPU6050_ReadAcc( int16_t *pACC_X , int16_t *pACC_Y , int16_t *pACC_Z );
 void MPU6050_data_send(void);

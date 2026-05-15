@@ -96,6 +96,12 @@ static nrfx_twi_t twi_instance = NRFX_TWI_INSTANCE(0);
 #define DEVICE_NAME                     "Limb_Assistant"                               /**< Name of device. Will be included in the advertising data. */
 #define NUS_SERVICE_UUID_TYPE           BLE_UUID_TYPE_VENDOR_BEGIN                  /**< UUID type for the Nordic UART Service (vendor specific). */
 
+#define MOUSE_TRANSPORT_MODE_NUS 				1   // MANUAL_EDIT_POINT: 1=NUS, 0=HID(骨架预留)
+
+
+#define MOUSE_PACKET_MODE_BINARY 1   
+
+#define MOUSE_SEND_TRANSPORT_NUS        1      // 1=NUS(当前), 0=预留HID
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
 
 #define APP_ADV_INTERVAL                800                                       /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
@@ -139,7 +145,7 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 
 #define FPU_EXCEPTION_MASK               0x0000009F                      //!< FPU exception mask used to clear exceptions in FPSCR register.
 #define FPU_FPSCR_REG_STACK_OFF          0x40                            //!< Offset of FPSCR register stacked during interrupt handling in FPU part stack
-#define TASK_FREQ              40 //采样任务时间周期，单位ms 
+#define TASK_FREQ              10 //采样任务时间周期，单位ms 
 APP_TIMER_DEF(task_timer); 			//用于替代延时的单次定时器
 APP_TIMER_DEF(init_timer); 			//用于计时的循环定时
 APP_TIMER_DEF(ac_timer);			//用于积分旋转角的定时器
@@ -197,11 +203,14 @@ void ble_send(uint8_t * string,uint16_t length)
 //	}
   // 如果是未连接状态 (INVALID_STATE) 或者 缓存区满 (RESOURCES)，不视为致命错误
     if (err_code != NRF_SUCCESS && 
-        err_code != NRF_ERROR_INVALID_STATE && 
-        err_code != NRF_ERROR_RESOURCES)  
-    {
-        APP_ERROR_CHECK(err_code);   
-    }
+    err_code != NRF_ERROR_INVALID_STATE && 
+    err_code != NRF_ERROR_RESOURCES &&
+    err_code != NRF_ERROR_NOT_FOUND &&
+    err_code != NRF_ERROR_BUSY &&
+    err_code != BLE_ERROR_GATTS_SYS_ATTR_MISSING)
+{
+    APP_ERROR_CHECK(err_code);
+}
 }
 
 /**@brief Function for assert macro callback.
@@ -215,6 +224,38 @@ void ble_send(uint8_t * string,uint16_t length)
  * @param[in] line_num    Line number of the failing ASSERT call.
  * @param[in] p_file_name File name of the failing ASSERT call.
  */
+
+
+
+
+static void mouse_transport_nus_cb(int8_t dx, int8_t dy)
+{
+#if MOUSE_TRANSPORT_MODE_NUS
+#if MOUSE_PACKET_MODE_BINARY
+    // ʽʽ: [0xA1, dx, dy]
+    uint8_t mouse_pkt[3];
+    mouse_pkt[0] = 0xA1;
+    mouse_pkt[1] = (uint8_t)dx;
+    mouse_pkt[2] = (uint8_t)dy;
+    ble_send(mouse_pkt, sizeof(mouse_pkt));
+#else
+    char mouse_report[32];
+    uint16_t send_len = (uint16_t)snprintf(mouse_report, sizeof(mouse_report), "M,%d,%d\n", dx, dy);
+    if (send_len > 0)
+    {
+        ble_send((uint8_t *)mouse_report, send_len);
+    }
+#endif
+#else
+    // MANUAL_EDIT_POINT: HID 3Ǽܣһ ble_hids_inp_rep_send
+    // ﱣǩֱ滻ΪHID淢͡
+    (void)dx;
+    (void)dy;
+#endif
+}
+
+
+
 void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
 {
     app_error_handler(DEAD_BEEF, line_num, p_file_name);
@@ -701,8 +742,9 @@ static void task_timer_handler(void * p_context)
 {
 
 	//mpu6050_init();
-	MPU6050_data_send();
-
+	//MPU6050_data_send();
+	(void)p_context;
+	MPU6050_mouse_report_send();
 }
 
 void MPU_Int_CallBack(nrfx_gpiote_pin_t pin, nrf_gpiote_polarity_t action)
@@ -784,9 +826,23 @@ int main(void)
 
 		advertising_start();
 		MY_LOG_DEBUG("ADV start");
+		mpu6050_set_mouse_transport(mouse_transport_nus_cb);
+		mpu6050_set_mouse_profile(MPU_MOUSE_PROFILE_BALANCED);  
+		//mpu6050_init();
+		twi_master_init();
 		
-		mpu6050_init();
-		
+		if (!mpu6050_init())
+		{
+			MY_LOG_ERROR("mpu6050 init failed");
+		}
+		else
+		{
+			MY_LOG_DEBUG("mpu6050 init success");
+			ret_code_t timer_start_err = app_timer_start(task_timer, APP_TIMER_TICKS(TASK_FREQ), NULL);
+			APP_ERROR_CHECK(timer_start_err);
+			MY_LOG_DEBUG("task timer started");
+		}
+	
     // Enter main loop.
     for (;;)
     {
