@@ -50,6 +50,8 @@
 
 
 #include <stdint.h>
+#include <ctype.h>
+#include <stdio.h>
 #include <string.h>
 #include "nordic_common.h"
 #include "nrf.h"
@@ -69,7 +71,7 @@
 #include "bsp_btn_ble.h"
 #include "nrf_pwr_mgmt.h"
 #include "nrfx_twi.h"
-
+#include <stdbool.h>
 
 #if defined (UART_PRESENT)
 #include "nrf_uart.h"
@@ -208,7 +210,7 @@ APP_TIMER_DEF(init_timer); 			//用于计时的循环定时
 APP_TIMER_DEF(ac_timer);			//用于积分旋转角的定时器
 
 uint8_t time_flag = 1;					// 延时任务标志
-
+static bool m_mouse_output_enabled = true; // 主进度B：鼠标输出总开关
 
 
 /**
@@ -315,7 +317,55 @@ static void mouse_transport_nus_cb(int8_t dx, int8_t dy)
 #endif
 }
 
+static uint16_t normalize_cmd(char * out, uint16_t out_size, uint8_t const * in, uint16_t in_len)
+{
+    uint16_t w = 0;
+    uint16_t i = 0;
 
+    if (out_size == 0)
+    {
+        return 0;
+    }
+
+    for (i = 0; i < in_len && w < (out_size - 1U); i++)
+    {
+        char c = (char)in[i];
+
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t')
+        {
+            continue;
+        }
+
+        out[w++] = (char)toupper((unsigned char)c);
+    }
+
+    out[w] = '\0';
+    return w;
+}
+
+static void send_text_frame(const char * text)
+{
+    uint16_t send_len = 0;
+    int32_t fmt_len = 0;
+    char buf[32];
+
+    fmt_len = snprintf(buf, sizeof(buf), "%s", text);
+    if (fmt_len <= 0)
+    {
+        return;
+    }
+
+    if (fmt_len >= (int32_t)sizeof(buf))
+    {
+        send_len = (uint16_t)(sizeof(buf) - 1U);
+    }
+    else
+    {
+        send_len = (uint16_t)fmt_len;
+    }
+
+    ble_send((uint8_t *)buf, send_len);
+}
 
 void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
 {
@@ -386,11 +436,42 @@ static void nus_data_handler(ble_nus_evt_t * p_evt)
 //    uint16_t len_per_send = 240; //单次发送的字节长度
 //    uint8_t* p_send = (uint8_t*)accel_data;
 	  uint8_t task_flag = 0;// 延时任务标志
-		if(p_evt->type){
-		if(time_flag)
-		app_timer_start(init_timer,APP_TIMER_TICKS(20),&task_flag); //单次计时20ms用于代替延时
-		time_flag =0;
-		}
+		if (p_evt->type == BLE_NUS_EVT_RX_DATA)
+{
+    uint8_t const * p_data = p_evt->params.rx_data.p_data;
+    uint16_t len = p_evt->params.rx_data.length;
+    char cmd[24];
+    uint16_t cmd_len = normalize_cmd(cmd, sizeof(cmd), p_data, len);
+
+    if (cmd_len == 4 &&
+        cmd[0] == 'S' && cmd[1] == 'T' && cmd[2] == 'O' && cmd[3] == 'P')
+    {
+        m_mouse_output_enabled = false;
+        MY_LOG_DEBUG("mouse output STOP");
+        send_text_frame("A,STOP\n");
+    }
+    else if (cmd_len == 5 &&
+             cmd[0] == 'S' && cmd[1] == 'T' && cmd[2] == 'A' &&
+             cmd[3] == 'R' && cmd[4] == 'T')
+    {
+        m_mouse_output_enabled = true;
+        MY_LOG_DEBUG("mouse output START");
+        send_text_frame("A,START\n");
+    }
+    else if (cmd_len == 6 &&
+             cmd[0] == 'S' && cmd[1] == 'T' && cmd[2] == 'A' &&
+             cmd[3] == 'T' && cmd[4] == 'U' && cmd[5] == 'S')
+    {
+        if (m_mouse_output_enabled)
+        {
+            send_text_frame("S,1\n");
+        }
+        else
+        {
+            send_text_frame("S,0\n");
+        }
+    }
+}
 
 }
 /**@snippet [Handling the data received over BLE] */
