@@ -9,15 +9,20 @@
 extern void ble_send(uint8_t * string, uint16_t length);
 
 #define TWI_INSTANCE_ID                  0
-#define GYRO_DEADZONE_DPS                1.2f
-#define GYRO_TO_MOUSE_GAIN               0.18f
+//#define GYRO_DEADZONE_DPS                1.2f
+//#define GYRO_TO_MOUSE_GAIN               0.18f
 #define GYRO_SENSITIVITY_LSB_PER_DPS     16.4f
 #define TWI_XFER_TIMEOUT_LOOPS           20000U
+extern void ble_send(uint8_t * string, uint16_t length);
+extern void debug_uart_send_bytes(uint8_t const * p_data, uint16_t len);
 
 static volatile bool m_xfer_done = false;
 static const nrf_drv_twi_t m_twi = NRF_DRV_TWI_INSTANCE(TWI_INSTANCE_ID);
 static mpu_mouse_transport_cb_t m_mouse_transport_cb = NULL;
-
+static float m_filt_gx_dps = 0.0f;
+static float m_filt_gy_dps = 0.0f;
+static float m_mouse_residual_x = 0.0f;
+static float m_mouse_residual_y = 0.0f;
 static mpu_mouse_profile_t m_mouse_profile = MPU_MOUSE_PROFILE_BALANCED;
 
 static void mouse_report_send_transport(int8_t dx, int8_t dy)
@@ -29,12 +34,26 @@ static void mouse_report_send_transport(int8_t dx, int8_t dy)
     }
 
 #if MOUSE_SEND_TRANSPORT_NUS
+    static uint32_t mouse_seq = 0;
     char mouse_report[32];
-    uint16_t send_len = (uint16_t)snprintf(mouse_report, sizeof(mouse_report), "M,%d,%d\n", dx, dy);
-    if (send_len > 0)
+    int32_t fmt_len = snprintf(mouse_report, sizeof(mouse_report), "M,%lu,%d,%d\n",
+                               (unsigned long)mouse_seq++, dx, dy);
+    uint16_t send_len = 0;
+
+    if (fmt_len <= 0)
     {
-        ble_send((uint8_t *)mouse_report, send_len);
+        return;
     }
+    if (fmt_len >= (int32_t)sizeof(mouse_report))
+    {
+        send_len = (uint16_t)(sizeof(mouse_report) - 1U);
+    }
+    else
+    {
+        send_len = (uint16_t)fmt_len;
+    }
+
+    ble_send((uint8_t *)mouse_report, send_len);
 #else
     // MANUAL_EDIT_POINT: ??HID????,?????? ble_hids_inp_rep_send(...)
     (void)dx;
@@ -52,6 +71,10 @@ void mpu6050_set_mouse_transport(mpu_mouse_transport_cb_t cb)
 void mpu6050_set_mouse_profile(mpu_mouse_profile_t profile)
 {
     m_mouse_profile = profile;
+	  m_filt_gx_dps = 0.0f;
+    m_filt_gy_dps = 0.0f;
+		//m_mouse_residual_x = 0.0f;
+    //m_mouse_residual_y = 0.0f;
 }
 static int8_t clamp_i8(int32_t value)
 {
@@ -65,6 +88,29 @@ static int8_t clamp_i8(int32_t value)
     }
     return (int8_t)value;
 }
+
+
+typedef struct
+{
+    float deadzone_dps;
+    float gain;
+    float lpf_alpha;
+} mpu_mouse_profile_cfg_t;
+
+static mpu_mouse_profile_cfg_t get_profile_cfg(mpu_mouse_profile_t profile)
+{
+    switch (profile)
+    {
+        case MPU_MOUSE_PROFILE_STABLE:
+            return (mpu_mouse_profile_cfg_t){ .deadzone_dps = 2.2f, .gain = 0.15f, .lpf_alpha = 0.20f };
+        case MPU_MOUSE_PROFILE_FAST:
+            return (mpu_mouse_profile_cfg_t){ .deadzone_dps = 0.8f, .gain = 0.25f, .lpf_alpha = 0.40f };
+        case MPU_MOUSE_PROFILE_BALANCED:
+        default:
+            return (mpu_mouse_profile_cfg_t){ .deadzone_dps = 1.2f, .gain = 0.18f, .lpf_alpha = 0.30f };
+    }
+}
+
 
 static bool twi_wait_done_with_timeout(void)
 {
@@ -242,32 +288,55 @@ bool MPU6050_ReadAcc(int16_t *pACC_X, int16_t *pACC_Y, int16_t *pACC_Z)
 
 void MPU6050_data_send(void)
 {
+    
+		static uint32_t gyro_seq = 0;
     int16_t gyro_value[3];
     char gyro_output[64];
     uint16_t send_len = 0;
+    uint32_t current_seq = gyro_seq++;
+
+    int32_t fmt_len = 0;
 
     if (MPU6050_ReadGyro(&gyro_value[0], &gyro_value[1], &gyro_value[2]))
     {
-        send_len = (uint16_t)snprintf(gyro_output, sizeof(gyro_output),
-                                      "x=%d y=%d z=%d",
-                                      gyro_value[0], gyro_value[1], gyro_value[2]);
+        fmt_len = snprintf(gyro_output, sizeof(gyro_output),
+                           "G,%lu,%d,%d,%d\n",
+                           (unsigned long)current_seq,
+                           gyro_value[0], gyro_value[1], gyro_value[2]);
     }
     else
     {
-        send_len = (uint16_t)snprintf(gyro_output, sizeof(gyro_output), "Read Gyro failed");
+        fmt_len = snprintf(gyro_output, sizeof(gyro_output),
+                           "G,%lu,ERR\n",
+                           (unsigned long)current_seq);
+    }
+		
+    //if (send_len > 0)
+		if (fmt_len <= 0)
+    {
+        return;
     }
 
-    if (send_len > 0)
+    if (fmt_len >= (int32_t)sizeof(gyro_output))
     {
-        ble_send((uint8_t *)gyro_output, send_len);
+        send_len = (uint16_t)(sizeof(gyro_output) - 1U);
     }
+    else
+    {
+       // ble_send((uint8_t *)gyro_output, send_len);
+			send_len = (uint16_t)fmt_len;
+        
+    }
+		ble_send((uint8_t *)gyro_output, send_len);
+    debug_uart_send_bytes((uint8_t const *)gyro_output, send_len);
 }
 
 void MPU6050_mouse_report_send(void)
 {
     int16_t gx_raw = 0, gy_raw = 0, gz_raw = 0;
-    char mouse_report[32];
-
+    //char mouse_report[32];
+		mpu_mouse_profile_cfg_t cfg = get_profile_cfg(m_mouse_profile);
+	
     if (!MPU6050_ReadGyro(&gx_raw, &gy_raw, &gz_raw))
     {
         return;
@@ -276,32 +345,45 @@ void MPU6050_mouse_report_send(void)
     float gx_dps = gx_raw / GYRO_SENSITIVITY_LSB_PER_DPS;
     float gy_dps = gy_raw / GYRO_SENSITIVITY_LSB_PER_DPS;
 
-    if ((gx_dps < GYRO_DEADZONE_DPS) && (gx_dps > -GYRO_DEADZONE_DPS))
+    //if ((gx_dps < GYRO_DEADZONE_DPS) && (gx_dps > -GYRO_DEADZONE_DPS))
+		 m_filt_gx_dps += cfg.lpf_alpha * (gx_dps - m_filt_gx_dps);
+    m_filt_gy_dps += cfg.lpf_alpha * (gy_dps - m_filt_gy_dps);
+
+    if ((m_filt_gx_dps < cfg.deadzone_dps) && (m_filt_gx_dps > -cfg.deadzone_dps))
     {
-        gx_dps = 0.0f;
+        //gx_dps = 0.0f;
+			m_filt_gx_dps = 0.0f;
     }
 
-    if ((gy_dps < GYRO_DEADZONE_DPS) && (gy_dps > -GYRO_DEADZONE_DPS))
+//    if ((gy_dps < GYRO_DEADZONE_DPS) && (gy_dps > -GYRO_DEADZONE_DPS))
+		 if ((m_filt_gy_dps < cfg.deadzone_dps) && (m_filt_gy_dps > -cfg.deadzone_dps))
     {
-        gy_dps = 0.0f;
+       // gy_dps = 0.0f;
+			m_filt_gy_dps = 0.0f;
     }
 
-    int8_t dx = clamp_i8((int32_t)(gy_dps * GYRO_TO_MOUSE_GAIN));
-    int8_t dy = clamp_i8((int32_t)(-gx_dps * GYRO_TO_MOUSE_GAIN));
+    //int8_t dx = clamp_i8((int32_t)(gy_dps * GYRO_TO_MOUSE_GAIN));
+    //int8_t dy = clamp_i8((int32_t)(-gx_dps * GYRO_TO_MOUSE_GAIN));
+		int8_t dx = clamp_i8((int32_t)(m_filt_gy_dps * cfg.gain));
+    int8_t dy = clamp_i8((int32_t)(-m_filt_gx_dps * cfg.gain));
 
     if (dx == 0 && dy == 0)
     {
         return;
     }
 
-    uint16_t send_len = (uint16_t)snprintf(mouse_report, sizeof(mouse_report), "M,%d,%d\n", dx, dy);
-    if (send_len > 0)
+    //uint16_t send_len = (uint16_t)snprintf(mouse_report, sizeof(mouse_report), "M,%d,%d\n", dx, dy);
+    //if (send_len > 0)
+		static uint16_t log_div = 0;
+    if ((log_div++ % 10U) == 0U)
     {
-        static uint16_t log_div = 0;
-        if ((log_div++ % 10U) == 0U)
-        {
-            MY_LOG_DEBUG("mouse dx=%d dy=%d gx=%d gy=%d", dx, dy, gx_raw, gy_raw);
-        }
-        ble_send((uint8_t *)mouse_report, send_len);
+        //static uint16_t log_div = 0;
+        //if ((log_div++ % 10U) == 0U)
+        //{
+       //    MY_LOG_DEBUG("mouse dx=%d dy=%d gx=%d gy=%d", dx, dy, gx_raw, gy_raw);
+        //}
+       // ble_send((uint8_t *)mouse_report, send_len);
+			MY_LOG_DEBUG("mouse dx=%d dy=%d gx=%d gy=%d", dx, dy, gx_raw, gy_raw);
     }
+		mouse_report_send_transport(dx, dy);
 }

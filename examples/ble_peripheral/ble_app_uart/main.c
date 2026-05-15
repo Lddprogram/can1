@@ -99,9 +99,11 @@ static nrfx_twi_t twi_instance = NRFX_TWI_INSTANCE(0);
 #define MOUSE_TRANSPORT_MODE_NUS 				1   // MANUAL_EDIT_POINT: 1=NUS, 0=HID(骨架预留)
 
 
-#define MOUSE_PACKET_MODE_BINARY 1   
+#define MOUSE_PACKET_MODE_BINARY 0   // 已弃用: 回调固定发送文本帧，避免nRF Connect显示invalid data
 
 #define MOUSE_SEND_TRANSPORT_NUS        1      // 1=NUS(当前), 0=预留HID
+#define APP_MAIN_PROGRESS_MODE_GYRO_NUS 0      // 主进度B: 1=发送陀螺仪原始数据到NUS, 0=发送鼠标位移
+#define APP_ENABLE_UART_MIRROR       0      // 1=额外镜像输出到硬件UART; 0=仅BLE，适配无串口的JLink/Dongle
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
 
 #define APP_ADV_INTERVAL                800                                       /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
@@ -134,6 +136,61 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 {
     {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE}
 };
+
+#if APP_ENABLE_UART_MIRROR
+static void uart_event_handle(app_uart_evt_t * p_event)
+{
+    if (p_event->evt_type == APP_UART_COMMUNICATION_ERROR)
+    {
+        APP_ERROR_HANDLER(p_event->data.error_communication);
+    }
+    else if (p_event->evt_type == APP_UART_FIFO_ERROR)
+    {
+        APP_ERROR_HANDLER(p_event->data.error_code);
+    }
+}
+
+static void uart_init(void)
+{
+    ret_code_t err_code;
+
+    app_uart_comm_params_t const comm_params =
+    {
+        .rx_pin_no    = RX_PIN_NUMBER,
+        .tx_pin_no    = TX_PIN_NUMBER,
+        .rts_pin_no   = RTS_PIN_NUMBER,
+        .cts_pin_no   = CTS_PIN_NUMBER,
+        .flow_control = APP_UART_FLOW_CONTROL_DISABLED,
+        .use_parity   = false,
+        .baud_rate    = UART_BAUDRATE_BAUDRATE_Baud115200
+    };
+
+    APP_UART_FIFO_INIT(&comm_params,
+                       UART_RX_BUF_SIZE,
+                       UART_TX_BUF_SIZE,
+                       uart_event_handle,
+                       APP_IRQ_PRIORITY_LOWEST,
+                       err_code);
+    APP_ERROR_CHECK(err_code);
+}
+
+void debug_uart_send_bytes(uint8_t const * p_data, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++)
+    {
+        while (app_uart_put(p_data[i]) != NRF_SUCCESS)
+        {
+            /* wait for FIFO room */
+        }
+    }
+}
+#else
+void debug_uart_send_bytes(uint8_t const * p_data, uint16_t len)
+{
+    (void)p_data;
+    (void)len;
+}
+#endif
 
 /* Private macro -------------------------------------------------------------*/
 
@@ -231,21 +288,25 @@ void ble_send(uint8_t * string,uint16_t length)
 static void mouse_transport_nus_cb(int8_t dx, int8_t dy)
 {
 #if MOUSE_TRANSPORT_MODE_NUS
-#if MOUSE_PACKET_MODE_BINARY
-    // ʽʽ: [0xA1, dx, dy]
-    uint8_t mouse_pkt[3];
-    mouse_pkt[0] = 0xA1;
-    mouse_pkt[1] = (uint8_t)dx;
-    mouse_pkt[2] = (uint8_t)dy;
-    ble_send(mouse_pkt, sizeof(mouse_pkt));
-#else
+    static uint32_t mouse_seq = 0;
     char mouse_report[32];
-    uint16_t send_len = (uint16_t)snprintf(mouse_report, sizeof(mouse_report), "M,%d,%d\n", dx, dy);
-    if (send_len > 0)
+    int32_t fmt_len = snprintf(mouse_report, sizeof(mouse_report), "M,%lu,%d,%d\n",
+                               (unsigned long)mouse_seq++, dx, dy);
+    uint16_t send_len = 0;
+
+    if (fmt_len <= 0)
     {
-        ble_send((uint8_t *)mouse_report, send_len);
+        return;
     }
-#endif
+    if (fmt_len >= (int32_t)sizeof(mouse_report))
+    {
+        send_len = (uint16_t)(sizeof(mouse_report) - 1U);
+    }
+    else
+    {
+        send_len = (uint16_t)fmt_len;
+    }
+    ble_send((uint8_t *)mouse_report, send_len);
 #else
     // MANUAL_EDIT_POINT: HID 3Ǽܣһ ble_hids_inp_rep_send
     // ﱣǩֱ滻ΪHID淢͡
@@ -742,9 +803,12 @@ static void task_timer_handler(void * p_context)
 {
 
 	//mpu6050_init();
-	//MPU6050_data_send();
 	(void)p_context;
+#if APP_MAIN_PROGRESS_MODE_GYRO_NUS
+	MPU6050_data_send();
+#else
 	MPU6050_mouse_report_send();
+#endif
 }
 
 void MPU_Int_CallBack(nrfx_gpiote_pin_t pin, nrf_gpiote_polarity_t action)
@@ -797,7 +861,9 @@ int main(void)
 		
 	
     // Initialize.
-    // uart_init();
+#if APP_ENABLE_UART_MIRROR
+    uart_init();
+#endif
 	log_init();
     // buttons_leds_init(&erase_bonds);
 	
