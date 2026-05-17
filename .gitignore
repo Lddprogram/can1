@@ -1,24 +1,2 @@
-﻿# Keil / ARMCC build outputs
-**/_build/
-*.o
-*.d
-*.crf
-*.lst
-*.map
-*.axf
-*.dep
-*.lnp
-*.htm
-*.build_log.htm
-
-# Logs
-JLinkLog.txt
-*.log
-
-# Keil user-specific files
-*.uvguix.*
-*.uvgui.*
-*.bak
-
-# VS Code / assistant logs
-.vscode/keil-assistant.log
+﻿__pycache__/
+*.pyc
