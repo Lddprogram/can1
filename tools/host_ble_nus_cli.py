@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
 """
-BLE NUS host tool (Route B): monitor + control + mouse move/click in one process.
+BLE NUS host tool (Route B): monitor + control in one process.
+
+Features:
+- Scan/connect by name (default: Limb_Assistant)
+- Subscribe NUS TX notify and parse frames (G/M/S/A)
+- Optionally send START/STOP/STATUS to NUS RX
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
+import ctypes
 import re
 import sys
 import time
-import collections
-
-
 
 from host_frame_monitor import Monitor
 
-try:
-    import pyautogui  # type: ignore
-except Exception:
-    pyautogui = None
 try:
     from bleak import BleakClient, BleakScanner
 except Exception:
     BleakClient = None
     BleakScanner = None
 
+try:
+    import pyautogui  # type: ignore
+except Exception:
+    pyautogui = None
+
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # write
 NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # notify
-
 M_RE = re.compile(r"^M,(\d+),(-?\d+),(-?\d+)$")
 
 
@@ -59,10 +63,13 @@ async def run(args) -> int:
 
     done = asyncio.Event()
     last_click_at = 0.0
-
     pending_click_side = None
     pending_click_until = 0.0
     click_window = collections.deque(maxlen=8)
+    click_armed_side = None
+    click_armed_at = 0.0
+    click_anchor_pos = None
+    move_lock_until = 0.0
     mouse_dev = None
     mouse_button_enum = None
     baseline_count = 0
@@ -70,10 +77,18 @@ async def run(args) -> int:
     baseline_dy_sum = 0.0
     baseline_dx = 0.0
     baseline_dy = 0.0
-
-
-    mouse_dev = None
-    mouse_button_enum = None
+    calibration_started = False
+    still_count = 0
+    waiting_still_printed = False
+    calibration_wait_started_at = 0.0
+    smooth_dx = 0.0
+    smooth_dy = 0.0
+    level_still_count = 0
+    center_x = None
+    center_y = None
+    last_level_center_at = 0.0
+    level_center_latched = False
+    saw_mouse_frame = False
 
     if args.move_mouse or args.click or args.center_on_start:
         try:
@@ -81,22 +96,129 @@ async def run(args) -> int:
             mouse_dev = Controller()
             mouse_button_enum = Button
         except Exception:
-            # print("ERROR: --move-mouse/--click needs pynput. Install with: pip install pynput", file=sys.stderr)
-            print("ERROR: --move-mouse/--click needs pynput. Install with: pip install pynput", file=sys.stderr)
+            print("ERROR: --move-mouse/--click/--center-on-start needs pynput. Install with: pip install pynput", file=sys.stderr)
             return 5
 
-    def maybe_move_mouse(line: str):
-        if not args.move_mouse:
-            return
+    def get_screen_center():
+        if pyautogui is not None:
+            sw, sh = pyautogui.size()
+            return sw // 2, sh // 2, "pyautogui"
+        if sys.platform.startswith("win"):
+            user32 = ctypes.windll.user32
+            sw = int(user32.GetSystemMetrics(0))
+            sh = int(user32.GetSystemMetrics(1))
+            return sw // 2, sh // 2, "win32"
+        raise RuntimeError("no supported screen-size provider (install pyautogui)")
+
+    def parse_mouse_frame(line: str):
         m = M_RE.match(line.strip())
         if not m:
+            return None
+        return float(int(m.group(2))), float(int(m.group(3)))
+
+    def update_calibration(dx: float, dy: float):
+        nonlocal baseline_count, baseline_dx_sum, baseline_dy_sum, baseline_dx, baseline_dy
+        nonlocal calibration_started, still_count, waiting_still_printed, calibration_wait_started_at
+        if not args.calibrate_level:
+            return True
+        if baseline_count >= args.calibrate_frames:
+            return True
+        if args.zero_mode == "still":
+            now = time.time()
+            if calibration_wait_started_at == 0.0:
+                calibration_wait_started_at = now
+            motion_mag = abs(dx) + abs(dy)
+            if motion_mag <= args.still_threshold:
+                still_count += 1
+            else:
+                still_count = 0
+            wait_elapsed_ms = (now - calibration_wait_started_at) * 1000.0
+            if args.still_wait_timeout_ms > 0 and wait_elapsed_ms >= args.still_wait_timeout_ms:
+                if not calibration_started:
+                    print(f"[CALIB] still-wait timeout {args.still_wait_timeout_ms}ms, force start zero capture")
+                still_count = args.still_frames
+            if still_count < args.still_frames:
+                if not waiting_still_printed:
+                    waiting_still_printed = True
+                    print(f"[CALIB] waiting still frames: need {args.still_frames}, threshold={args.still_threshold}")
+                return False
+            if waiting_still_printed and not calibration_started:
+                print("[CALIB] still condition reached, start zero capture")
+        if not calibration_started:
+            calibration_started = True
+            print(f"[CALIB] start collecting {args.calibrate_frames} frames (keep device level)")
+        baseline_dx_sum += dx
+        baseline_dy_sum += dy
+        baseline_count += 1
+        if baseline_count % 10 == 0 and baseline_count < args.calibrate_frames:
+            print(f"[CALIB] collecting {baseline_count}/{args.calibrate_frames}")
+        if baseline_count == args.calibrate_frames:
+            baseline_dx = baseline_dx_sum / float(args.calibrate_frames)
+            baseline_dy = baseline_dy_sum / float(args.calibrate_frames)
+            print(f"[CALIB] done baseline_dx={baseline_dx:.2f} baseline_dy={baseline_dy:.2f}")
+            return True
+        return False
+
+    def maybe_move_mouse(line: str):
+        nonlocal move_lock_until, saw_mouse_frame, smooth_dx, smooth_dy
+        nonlocal level_still_count, center_x, center_y, last_level_center_at, level_center_latched
+        if not args.move_mouse:
+            return
+        parsed = parse_mouse_frame(line)
+        if parsed is None:
+            return
+        saw_mouse_frame = True
+        dx, dy = parsed
+
+        if not update_calibration(dx, dy):
             return
 
-        dx = int(m.group(2))
-        dy = int(m.group(3))
+        dx -= baseline_dx
+        dy -= baseline_dy
 
-        dx_s = int(dx * args.move_scale)
-        dy_s = int(dy * args.move_scale)
+        # Suppress near-level drift when device returns to horizontal.
+        motion_mag = abs(dx) + abs(dy)
+        if motion_mag <= args.level_hold_threshold:
+            level_still_count += 1
+            # Decay filter state quickly to avoid residual wander.
+            smooth_dx *= 0.6
+            smooth_dy *= 0.6
+            if level_still_count >= args.level_hold_frames:
+                if args.auto_center_on_level and mouse_dev is not None:
+                    now = time.time()
+                    if level_center_latched and (now - last_level_center_at) * 1000.0 < args.level_recenter_cooldown_ms:
+                        return
+                    if center_x is None or center_y is None:
+                        try:
+                            cx, cy, _ = get_screen_center()
+                            center_x, center_y = cx, cy
+                        except Exception:
+                            center_x, center_y = None, None
+                    if center_x is not None and center_y is not None:
+                        mouse_dev.position = (center_x, center_y)
+                        last_level_center_at = now
+                        level_center_latched = True
+                return
+        else:
+            level_still_count = 0
+            level_center_latched = False
+
+        # Simple EMA smoothing for cursor stability.
+        smooth_dx = (args.smooth_alpha * dx) + ((1.0 - args.smooth_alpha) * smooth_dx)
+        smooth_dy = (args.smooth_alpha * dy) + ((1.0 - args.smooth_alpha) * smooth_dy)
+
+        dx_s = int(smooth_dx * args.move_scale)
+        dy_s = int(smooth_dy * args.move_scale)
+
+        # Per-frame clamp to avoid large spikes causing jumpy cursor movement.
+        if dx_s > args.max_step:
+            dx_s = args.max_step
+        elif dx_s < -args.max_step:
+            dx_s = -args.max_step
+        if dy_s > args.max_step:
+            dy_s = args.max_step
+        elif dy_s < -args.max_step:
+            dy_s = -args.max_step
 
         if args.invert_x:
             dx_s = -dx_s
@@ -111,46 +233,87 @@ async def run(args) -> int:
         if dx_s == 0 and dy_s == 0:
             return
 
+        if time.time() < move_lock_until:
+            return
+
         print(f"[MOVE] dx={dx_s} dy={dy_s}")
         if mouse_dev is not None:
             mouse_dev.move(dx_s, dy_s)
 
     def maybe_gesture_click(line: str):
-        # nonlocal last_click_at
-        nonlocal last_click_at, pending_click_side, pending_click_until
+        nonlocal last_click_at, pending_click_side, pending_click_until, click_armed_side, click_armed_at, click_anchor_pos, move_lock_until, saw_mouse_frame
         if not args.gesture_click:
             return
-
-        m = M_RE.match(line.strip())
-        if not m:
+        parsed = parse_mouse_frame(line)
+        if parsed is None:
             return
+        saw_mouse_frame = True
 
-        dx = int(m.group(2))
-        dy = int(m.group(3))
+        dx = int(parsed[0] - baseline_dx)
+        dy = int(parsed[1] - baseline_dy)
         now = time.time()
         click_window.append((dx, dy))
-         
+
+        if args.calibrate_level and baseline_count < args.calibrate_frames:
+            return
+
         if now - last_click_at < args.click_cooldown_ms / 1000.0:
             return
 
-        # if dx <= -args.click_threshold:
-        #     last_click_at = now
-        #     print(f"[GESTURE] LEFT_CLICK dx={dx}")
-        #     if args.click and mouse_dev is not None and mouse_button_enum is not None:
-        #         mouse_dev.click(mouse_button_enum.left, 1)
-        # elif dx >= args.click_threshold:
-        #     last_click_at = now
-        #     print(f"[GESTURE] RIGHT_CLICK dx={dx}")
-        #     if args.click and mouse_dev is not None and mouse_button_enum is not None:
-        #         mouse_dev.click(mouse_button_enum.right, 1)
-     # flick-then-settle trigger: reduce accidental clicks during continuous movement
+        if args.click_mode == "hysteresis":
+            if click_armed_side is None:
+                # Require horizontal dominance to reduce accidental triggers during diagonal motions.
+                if abs(dx) < abs(dy) * args.click_axis_ratio:
+                    return
+                if dx <= -args.click_threshold:
+                    click_armed_side = "LEFT"
+                    click_armed_at = now
+                    print(f"[GESTURE] armed LEFT dx={dx}")
+                    move_lock_until = now + (args.move_lock_ms / 1000.0)
+                    if mouse_dev is not None and args.click_anchor_restore:
+                        click_anchor_pos = mouse_dev.position
+                elif dx >= args.click_threshold:
+                    click_armed_side = "RIGHT"
+                    click_armed_at = now
+                    print(f"[GESTURE] armed RIGHT dx={dx}")
+                    move_lock_until = now + (args.move_lock_ms / 1000.0)
+                    if mouse_dev is not None and args.click_anchor_restore:
+                        click_anchor_pos = mouse_dev.position
+                return
+
+            arm_timeout = (now - click_armed_at) * 1000.0 >= args.click_arm_timeout_ms
+            if abs(dx) <= args.release_threshold or arm_timeout:
+                last_click_at = now
+                if click_armed_side == "LEFT":
+                    if arm_timeout:
+                        print("[GESTURE] LEFT_CLICK timeout")
+                    else:
+                        print("[GESTURE] LEFT_CLICK hysteresis")
+                    if args.click and mouse_dev is not None and mouse_button_enum is not None:
+                        mouse_dev.click(mouse_button_enum.left, 1)
+                else:
+                    if arm_timeout:
+                        print("[GESTURE] RIGHT_CLICK timeout")
+                    else:
+                        print("[GESTURE] RIGHT_CLICK hysteresis")
+                    if args.click and mouse_dev is not None and mouse_button_enum is not None:
+                        mouse_dev.click(mouse_button_enum.right, 1)
+                if args.click_anchor_restore and mouse_dev is not None and click_anchor_pos is not None:
+                    mouse_dev.position = click_anchor_pos
+                click_armed_side = None
+                click_anchor_pos = None
+            return
+
+        # flick-then-settle trigger
         if pending_click_side is None:
             if dx <= -args.click_threshold:
                 pending_click_side = "LEFT"
                 pending_click_until = now + (args.settle_ms / 1000.0)
+                move_lock_until = pending_click_until + (args.move_lock_ms / 1000.0)
             elif dx >= args.click_threshold:
                 pending_click_side = "RIGHT"
                 pending_click_until = now + (args.settle_ms / 1000.0)
+                move_lock_until = pending_click_until + (args.move_lock_ms / 1000.0)
             return
 
         if now > pending_click_until:
@@ -158,7 +321,6 @@ async def run(args) -> int:
             if click_window:
                 avg_mag = sum(abs(a) + abs(b) for a, b in click_window) / float(len(click_window))
             if avg_mag <= args.settle_threshold:
-            # if True:
                 last_click_at = now
                 if pending_click_side == "LEFT":
                     print(f"[GESTURE] LEFT_CLICK settle avg={avg_mag:.2f}")
@@ -169,7 +331,7 @@ async def run(args) -> int:
                     if args.click and mouse_dev is not None and mouse_button_enum is not None:
                         mouse_dev.click(mouse_button_enum.right, 1)
             pending_click_side = None
-            
+
     def on_tx(_: int, data: bytearray):
         text = bytes(data).decode(errors="ignore")
         for line in text.splitlines():
@@ -178,7 +340,9 @@ async def run(args) -> int:
             maybe_gesture_click(line)
 
     async with BleakClient(dev.address) as client:
-        # bleak API compatibility
+        # Bleak compatibility:
+        # - old versions: await client.get_services()
+        # - newer versions: services available via client.services after connect
         if hasattr(client, "get_services"):
             svcs = await client.get_services()
             svc_uuids = {s.uuid.lower() for s in svcs}
@@ -192,30 +356,35 @@ async def run(args) -> int:
         await client.start_notify(NUS_TX_UUID, on_tx)
         print("[notify] subscribed NUS TX")
 
-        # if args.center_on_start and mouse_dev is not None:
-        #     try:
-        #         sw, sh = mouse_dev.screen_size
-        #         mouse_dev.position = (sw // 2, sh // 2)
-        #         print(f"[MOUSE] centered to ({sw // 2}, {sh // 2})")
-        #     except Exception as e:
-        #         print(f"[WARN] failed to center mouse: {e}")
-        
         if args.center_on_start and mouse_dev is not None:
             try:
-                if pyautogui is None:
-                    raise RuntimeError("pyautogui not installed")
-                sw, sh = pyautogui.size()
-                cx, cy = sw // 2, sh // 2
+                cx, cy, provider = get_screen_center()
+                center_x, center_y = cx, cy
                 mouse_dev.position = (cx, cy)
-                print(f"[MOUSE] centered to ({cx}, {cy})")
+                print(f"[MOUSE] centered to ({cx}, {cy}) via {provider}")
             except Exception as e:
                 print(f"[WARN] failed to center mouse: {e}")
 
+        if args.recenter_after_calib and args.center_on_start and mouse_dev is not None:
+            # Recenter once after startup hold so late startup motion won't leave pointer offset.
+            await asyncio.sleep(0.05)
+            try:
+                cx, cy, provider = get_screen_center()
+                center_x, center_y = cx, cy
+                mouse_dev.position = (cx, cy)
+                print(f"[MOUSE] re-centered to ({cx}, {cy}) via {provider}")
+            except Exception as e:
+                print(f"[WARN] failed to re-center mouse: {e}")
+
+        if args.startup_hold_ms > 0:
+            print(f"[STARTUP] hold {args.startup_hold_ms}ms for level placement")
+            await asyncio.sleep(args.startup_hold_ms / 1000.0)
 
         if args.cmd:
             payload = (args.cmd.strip().upper() + "\n").encode("ascii", errors="ignore")
             print(f"[write] {payload!r}")
             await client.write_gatt_char(NUS_RX_UUID, payload, response=True)
+            # Give firmware a brief window to enqueue ACK/STATUS before heavy stream dominates output.
             await asyncio.sleep(0.2)
 
         if args.duration > 0:
@@ -231,6 +400,12 @@ async def run(args) -> int:
 
         await client.stop_notify(NUS_TX_UUID)
 
+    if args.calibrate_level:
+        if not saw_mouse_frame:
+            print("[WARN] calibration did not run: no M frames received")
+        elif baseline_count < args.calibrate_frames:
+            print(f"[WARN] calibration incomplete: {baseline_count}/{args.calibrate_frames} frames")
+
     print(mon.summary())
     return 0
 
@@ -241,24 +416,68 @@ def main() -> int:
     ap.add_argument("--scan-timeout", type=float, default=8.0)
     ap.add_argument("--duration", type=float, default=10.0, help="Monitor seconds, 0=until Ctrl+C")
     ap.add_argument("--cmd", choices=["START", "STOP", "STATUS"], help="Optional one-shot command")
-
     ap.add_argument("--move-mouse", action="store_true", help="Apply M dx/dy to OS mouse movement")
     ap.add_argument("--move-scale", type=float, default=1.0, help="Scale factor for dx/dy -> OS movement")
     ap.add_argument("--move-deadband", type=int, default=0, help="Deadband after scaling")
+    ap.add_argument("--smooth-alpha", type=float, default=0.35, help="EMA smoothing alpha (0<alpha<=1)")
+    ap.add_argument("--max-step", type=int, default=30, help="Max absolute move step per frame after scaling")
     ap.add_argument("--invert-x", action="store_true", help="Invert X movement")
     ap.add_argument("--invert-y", action="store_true", help="Invert Y movement")
-
     ap.add_argument("--gesture-click", action="store_true", help="Map fast left/right rotation to mouse clicks")
+    ap.add_argument("--click-mode", choices=["settle", "hysteresis"], default="hysteresis", help="Gesture click detector mode")
     ap.add_argument("--click-threshold", type=int, default=50, help="|dx| threshold for click trigger")
+    ap.add_argument("--release-threshold", type=int, default=15, help="Release threshold for hysteresis click mode")
+    ap.add_argument("--click-axis-ratio", type=float, default=1.0, help="Require |dx| >= ratio*|dy| for click arming")
+    ap.add_argument("--click-arm-timeout-ms", type=int, default=220, help="Auto-fire armed click if release condition is not met in time")
     ap.add_argument("--click-cooldown-ms", type=int, default=300, help="Min interval between clicks")
     ap.add_argument("--settle-ms", type=int, default=120, help="Flick-to-settle window for click confirm")
     ap.add_argument("--settle-threshold", type=float, default=12.0, help="Avg motion magnitude threshold to confirm click")
+    ap.add_argument("--move-lock-ms", type=int, default=120, help="Freeze move around click trigger window")
+    ap.add_argument("--click-anchor-restore", action="store_true", help="Restore cursor to armed position after click to reduce trigger drift")
     ap.add_argument("--click", action="store_true", help="Actually click OS mouse (needs pynput)")
     ap.add_argument("--center-on-start", action="store_true", help="Move OS cursor to screen center on script start")
+    ap.add_argument("--recenter-after-calib", action="store_true", help="Recenter cursor once after startup hold/calibration phase")
     ap.add_argument("--calibrate-level", action="store_true", help="Use startup frames as level baseline (keep device level)")
     ap.add_argument("--calibrate-frames", type=int, default=40, help="Frame count used for baseline calibration")
+    ap.add_argument("--zero-mode", choices=["immediate", "still"], default="still", help="How to start zero capture when calibrate-level is enabled")
+    ap.add_argument("--still-threshold", "--still--threshold", type=float, default=3.0, help="Stillness threshold on |dx|+|dy| for zero capture")
+    ap.add_argument("--still-frames", type=int, default=20, help="Consecutive still frames required before zero capture starts")
+    ap.add_argument("--still-wait-timeout-ms", type=int, default=3000, help="Timeout for still waiting; then force zero capture start")
+    ap.add_argument("--auto-center-on-level", action="store_true", help="When device returns level, lock cursor back to center to suppress drift")
+    ap.add_argument("--level-hold-threshold", type=float, default=3.0, help="Level-hold threshold on |dx|+|dy|")
+    ap.add_argument("--level-hold-frames", type=int, default=10, help="Consecutive level frames before level-hold lock")
+    ap.add_argument("--level-recenter-cooldown-ms", type=int, default=1200, help="Cooldown to prevent repeated rapid level re-centering")
+    ap.add_argument("--startup-hold-ms", type=int, default=0, help="Hold time before processing movement/clicks")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+
+    if not (0.0 < args.smooth_alpha <= 1.0):
+        print("ERROR: --smooth-alpha must be in (0, 1].", file=sys.stderr)
+        return 2
+    if args.max_step < 1:
+        print("ERROR: --max-step must be >= 1.", file=sys.stderr)
+        return 2
+    if args.click_axis_ratio < 0.0:
+        print("ERROR: --click-axis-ratio must be >= 0.", file=sys.stderr)
+        return 2
+    if args.click_arm_timeout_ms < 0:
+        print("ERROR: --click-arm-timeout-ms must be >= 0.", file=sys.stderr)
+        return 2
+    if args.still_threshold < 0.0:
+        print("ERROR: --still-threshold must be >= 0.", file=sys.stderr)
+        return 2
+    if args.still_wait_timeout_ms < 0:
+        print("ERROR: --still-wait-timeout-ms must be >= 0.", file=sys.stderr)
+        return 2
+    if args.level_hold_threshold < 0.0:
+        print("ERROR: --level-hold-threshold must be >= 0.", file=sys.stderr)
+        return 2
+    if args.level_hold_frames < 1:
+        print("ERROR: --level-hold-frames must be >= 1.", file=sys.stderr)
+        return 2
+    if args.level_recenter_cooldown_ms < 0:
+        print("ERROR: --level-recenter-cooldown-ms must be >= 0.", file=sys.stderr)
+        return 2
 
     return asyncio.run(run(args))
 
