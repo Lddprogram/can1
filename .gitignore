@@ -1,3 +1,93 @@
-﻿__pycache__/
+﻿# =========================
+# Python generated files
+# =========================
+__pycache__/
 **/__pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.py[cod]
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Keil / ARMCC build outputs
+# =========================
+**/_build/
+**/Objects/
+**/Listings/
+
+*.o
+*.d
+*.crf
+*.lst
+*.map
+*.axf
+*.dep
+*.lnp
+*.htm
+*.build_log.htm
+*.iex
+*.sct
+*.tra
+*.fed
+*.bak
+
+# Keil user-specific files
+*.uvguix.*
+*.uvgui.*
+*.uvopt
+*.uvoptx.lock
+*.scvd
+
+# 注意：
+# 如果你需要保留可烧录固件，不要忽略 *.hex
+# 如果你只想管理源码，可以取消下一行注释
+# *.hex
+
+# =========================
+# J-Link / RTT / debug logs
+# =========================
+JLinkLog.txt
+JLinkSettings.ini
+*.log
+*.rtt
+
+# =========================
+# VS Code
+# =========================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# VS Code plugin logs
+.vscode/keil-assistant.log
+
+# =========================
+# OS generated files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
+*.swp
+*.swo
+~$*
